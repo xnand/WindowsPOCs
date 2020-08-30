@@ -302,7 +302,7 @@ void printUsage(wchar_t* argv[]) {
 	std::wcout << "options:\n";
 	std::wcout << "\t-p,--pipe: path to the named pipe\n";
 	std::wcout << "\t-e,--executable: path to the executable to run with the impersonated token's privileges; default = cmd.exe\n";
-	std::wcout << "\t-u,--user: username to target\n; default = any";
+	std::wcout << "\t-u,--user: username to target; default = any\n";
 	std::wcout << "\t-o,--outfile: output log file path; default = C:\\NamedPipeTokenImpersonationPOC.log\n";
 }
 
@@ -411,7 +411,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 			fSuccess = ReadFile(
 				hPipe,
 				pchRequest,
-				0x1000,
+				BUFSIZE,
 				&cbBytesRead,
 				NULL
 			);
